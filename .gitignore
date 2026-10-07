@@ -1,0 +1,26 @@
+# Release and review artifacts (never committed)
+threat-model/
+release-package/
+SECURITY-FINDINGS.md
+.ash/
+ash_output/
+.aws-sam/
+.kiro/
+
+# Local deploy config can contain account-specific ARNs
+samconfig.toml
+samconfig.yaml
+
+# Source and office artifacts
+*.docx
+*.zip
+*.drawio
+*.bkp
+.DS_Store
+__MACOSX/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+*.pem
