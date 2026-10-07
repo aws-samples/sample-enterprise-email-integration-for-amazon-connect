@@ -1,0 +1,734 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Sample (non-production): route Microsoft 365 email through Amazon Connect Customer
+  using AWS Lambda and Microsoft Graph, with conversation threading preserved.
+
+Parameters:
+  ConnectInstanceArn:
+    Type: String
+    Description: >-
+      Full ARN of your Amazon Connect Customer instance, in the same account and Region as this stack.
+      Example: arn:aws:connect:us-east-1:123456789012:instance/11111111-2222-3333-4444-555555555555
+    AllowedPattern: '^arn:aws:connect:[a-z0-9-]+:\d{12}:instance/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
+    ConstraintDescription: Must be arn:aws:connect:<region>:<account-id>:instance/<instance-id>, where <instance-id> is a UUID.
+
+  InboundContactFlowId:
+    Type: String
+    Description: >-
+      ID of the inbound email flow that new email contacts start in. Find it at the end of the flow ARN
+      on the flow's page in the Amazon Connect admin website.
+    AllowedPattern: '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
+    ConstraintDescription: Must be a flow ID (a UUID), not a flow name or ARN.
+
+  DestinationEmailAddress:
+    Type: String
+    Description: >-
+      Email address configured in your Amazon Connect Customer instance that inbound email is delivered to,
+      for example support@<instance-alias>.email.connect.aws or an address on your own verified domain.
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: Must be a single email address.
+
+  ConnectStorageBucketName:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. Name of the S3 bucket your Amazon Connect instance uses for email message storage. When set,
+      the outbound function can read only that bucket. When empty, it can read buckets in this account whose
+      names start with amazon-connect-.
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Must be empty or a valid S3 bucket name.
+
+  ConnectStorageKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. ARN of the AWS KMS key that encrypts your Amazon Connect email storage bucket. When set,
+      kms:Decrypt is limited to that key. When empty, kms:Decrypt is allowed only through Amazon S3 in this
+      Region and account.
+    AllowedPattern: '^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:key/[a-zA-Z0-9-]+$'
+    ConstraintDescription: Must be empty or a KMS key ARN (not an alias).
+
+  BatchSize:
+    Type: Number
+    Description: Maximum number of unread emails to process on each poll (1 to 50).
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+
+  PollingIntervalMinutes:
+    Type: Number
+    Description: Minutes between inbound mailbox polls (1 to 60).
+    Default: 5
+    MinValue: 1
+    MaxValue: 60
+
+  ReserveInboundConcurrency:
+    Type: String
+    Description: >-
+      Reserve one concurrent execution for the inbound function so polls never overlap. Choose false if
+      deployment fails with "decreases account's UnreservedConcurrentExecution below its minimum value",
+      which happens in accounts with a low Lambda concurrency quota.
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  # EventBridge rate() requires the singular "minute" when the value is 1.
+  PollingIntervalIsOne: !Equals [!Ref PollingIntervalMinutes, 1]
+  HasConnectStorageBucket: !Not [!Equals [!Ref ConnectStorageBucketName, '']]
+  HasConnectStorageKmsKey: !Not [!Equals [!Ref ConnectStorageKmsKeyArn, '']]
+  ReserveConcurrency: !Equals [!Ref ReserveInboundConcurrency, 'true']
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Amazon Connect Customer
+        Parameters:
+          - ConnectInstanceArn
+          - InboundContactFlowId
+          - DestinationEmailAddress
+      - Label:
+          default: Amazon Connect email storage (optional)
+        Parameters:
+          - ConnectStorageBucketName
+          - ConnectStorageKmsKeyArn
+      - Label:
+          default: Inbound polling
+        Parameters:
+          - BatchSize
+          - PollingIntervalMinutes
+          - ReserveInboundConcurrency
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Customer managed KMS key for the credentials secret, the dead-letter queue,
+  # the function log groups and the function environment variables. The
+  # account statement lets IAM policies grant use of the key, so the function
+  # roles below (and administrators) can use it. The service statements are
+  # limited to this stack's log groups and to this account.
+  # ---------------------------------------------------------------------------
+  SampleEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts the credentials secret, dead-letter queue, log groups and function environment variables for the Amazon Connect Microsoft 365 email sample
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountToManageKeyThroughIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # CloudWatch Logs encrypts this stack's two function log groups only.
+          - Sid: AllowCloudWatchLogsForThisStacksLogGroups
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/connect-m365-*-email-${AWS::StackName}'
+          # EventBridge encrypts the events it sends to the dead-letter queue.
+          - Sid: AllowEventBridgeToSendToDeadLetterQueue
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # Microsoft 365 credentials. CloudFormation generates the secret name so stacks
+  # never collide. Update tenant_id, client_id, client_secret and mailbox_email
+  # in the console after deployment; the functions do nothing until you do.
+  # ---------------------------------------------------------------------------
+  M365Credentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Microsoft Entra ID app credentials and mailbox for the Amazon Connect Microsoft 365 email sample
+      KmsKeyId: !GetAtt SampleEncryptionKey.Arn
+      GenerateSecretString:
+        SecretStringTemplate: '{"tenant_id":"REPLACE_ME","client_id":"REPLACE_ME","mailbox_email":"REPLACE_ME"}'
+        GenerateStringKey: client_secret
+        ExcludeCharacters: '"@/\'
+
+  # ---------------------------------------------------------------------------
+  # Inbound attachment staging. Connect reads objects through 1-hour presigned URLs.
+  # Versioning is on to protect against accidental overwrite or delete; old
+  # versions are removed after 1 day so extra copies of attachments do not pile up.
+  # ---------------------------------------------------------------------------
+  InboundAttachmentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: attachments/
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAttachments
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  InboundAttachmentsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InboundAttachmentsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt InboundAttachmentsBucket.Arn
+              - !Sub '${InboundAttachmentsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: AllowConnectServiceAccess
+            Effect: Allow
+            Principal:
+              Service: connect.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt InboundAttachmentsBucket.Arn
+              - !Sub '${InboundAttachmentsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: AllowInboundFunctionRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt InboundLambdaExecutionRole.Arn
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Sub '${InboundAttachmentsBucket.Arn}/*'
+
+  # ---------------------------------------------------------------------------
+  # S3 server access logs for the attachments bucket. The log bucket also logs
+  # its own access under the self/ prefix (LoggingConfiguration with no
+  # destination writes to the same bucket), so every bucket in the stack has
+  # access logging. Both prefixes expire after 90 days.
+  # ---------------------------------------------------------------------------
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    # Kept on stack delete: access logs are an audit record, and S3 delivers
+    # them for hours after the last request, so the bucket would not be empty.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Server access log delivery supports SSE-S3 only on the destination bucket.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        LogFilePrefix: self/
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: AllowS3ServerAccessLogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket.Arn}/attachments/*'
+            Condition:
+              ArnLike:
+                'aws:SourceArn': !GetAtt InboundAttachmentsBucket.Arn
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: AllowS3ServerAccessLogDeliveryForThisBucket
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket.Arn}/self/*'
+            Condition:
+              ArnLike:
+                'aws:SourceArn': !GetAtt AccessLogsBucket.Arn
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # Log groups with fixed names, created before the functions (LoggingConfig
+  # references them), so Lambda never creates its own copy first.
+  # ---------------------------------------------------------------------------
+  InboundLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/connect-m365-inbound-email-${AWS::StackName}'
+      KmsKeyId: !GetAtt SampleEncryptionKey.Arn
+      RetentionInDays: 30
+
+  OutboundLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/connect-m365-outbound-email-${AWS::StackName}'
+      KmsKeyId: !GetAtt SampleEncryptionKey.Arn
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # IAM roles (one per function, scoped resources)
+  # ---------------------------------------------------------------------------
+  InboundLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InboundEmailPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt InboundLogGroup.Arn
+              - Sid: ReadM365Secret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue  # pragma: allowlist secret (IAM action name, not a secret)
+                Resource: !Ref M365Credentials
+              - Sid: StageAttachments
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${InboundAttachmentsBucket.Arn}/*'
+              - Sid: StartAndThreadEmailContacts
+                Effect: Allow
+                Action:
+                  - connect:StartEmailContact
+                  - connect:DescribeContact
+                Resource:
+                  - !Ref ConnectInstanceArn
+                  - !Sub '${ConnectInstanceArn}/*'
+              - Sid: SendFailedInvocationsToDlq
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt InboundDeadLetterQueue.Arn
+              - Sid: UseSampleKeyForSecretAndDlq
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt SampleEncryptionKey.Arn
+
+  OutboundLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OutboundEmailPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt OutboundLogGroup.Arn
+              - Sid: ReadM365Secret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue  # pragma: allowlist secret (IAM action name, not a secret)
+                Resource: !Ref M365Credentials
+              - Sid: DecryptM365Secret
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt SampleEncryptionKey.Arn
+              - Sid: ReadReplyAndAttachments
+                Effect: Allow
+                Action:
+                  - connect:ListInstanceStorageConfigs
+                  - connect:DescribeContact
+                  - connect:ListContactReferences
+                  - connect:GetAttachedFile
+                  - connect:StopContact
+                Resource:
+                  - !Ref ConnectInstanceArn
+                  - !Sub '${ConnectInstanceArn}/*'
+              - !If
+                - HasConnectStorageBucket
+                - Sid: ReadConnectEmailStorage
+                  Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:ListBucket
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${ConnectStorageBucketName}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${ConnectStorageBucketName}/*'
+                # Connect creates its storage bucket with an amazon-connect- prefix and a
+                # generated suffix, so the name is unknown at authoring time. The account
+                # condition keeps the wildcard inside this account.
+                - Sid: ReadConnectEmailStorage
+                  Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:ListBucket
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::amazon-connect-*'
+                    - !Sub 'arn:${AWS::Partition}:s3:::amazon-connect-*/*'
+                  Condition:
+                    StringEquals:
+                      'aws:ResourceAccount': !Ref AWS::AccountId
+              - !If
+                - HasConnectStorageKmsKey
+                - Sid: DecryptConnectEmailStorage
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref ConnectStorageKmsKeyArn
+                # Key unknown at authoring time: allow decrypt only when the request
+                # comes through Amazon S3 in this Region for this account.
+                - Sid: DecryptConnectEmailStorage
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+                      'kms:CallerAccount': !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # Functions
+  # ---------------------------------------------------------------------------
+  InboundEmailProcessor:
+    Type: AWS::Serverless::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: Calls Microsoft Graph on the public internet. A VPC needs a NAT gateway (extra cost) and adds no control for this traffic. Listed under production considerations.
+    Properties:
+      FunctionName: !Sub 'connect-m365-inbound-email-${AWS::StackName}'
+      Description: Polls the Microsoft 365 mailbox and starts Amazon Connect email contacts
+      CodeUri: src/inbound/
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt InboundLambdaExecutionRole.Arn
+      KmsKeyArn: !GetAtt SampleEncryptionKey.Arn
+      Timeout: 120
+      MemorySize: 512
+      ReservedConcurrentExecutions: !If [ReserveConcurrency, 1, !Ref AWS::NoValue]
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt InboundDeadLetterQueue.Arn
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref InboundLogGroup
+      Environment:
+        Variables:
+          SECRETS_MANAGER_SECRET_NAME: !Ref M365Credentials
+          S3_BUCKET_NAME: !Ref InboundAttachmentsBucket
+          BATCH_SIZE: !Ref BatchSize
+          CONNECT_INSTANCE_ID: !Select [1, !Split ['instance/', !Ref ConnectInstanceArn]]
+          CONNECT_CONTACT_FLOW_ID: !Ref InboundContactFlowId
+          DESTINATION_EMAIL_ADDRESS: !Ref DestinationEmailAddress
+
+  OutboundEmailProcessor:
+    Type: AWS::Serverless::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: Invoked synchronously by Amazon Connect, once per agent reply. A reservation would throttle replies during busy periods and fail them.
+          - id: CKV_AWS_116
+            comment: Invoked synchronously by Amazon Connect. Lambda dead-letter queues apply only to asynchronous invocations.
+          - id: CKV_AWS_117
+            comment: Calls Microsoft Graph on the public internet. A VPC needs a NAT gateway (extra cost) and adds no control for this traffic. Listed under production considerations.
+    Properties:
+      FunctionName: !Sub 'connect-m365-outbound-email-${AWS::StackName}'
+      Description: Sends Amazon Connect agent email replies through Microsoft 365
+      CodeUri: src/outbound/
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt OutboundLambdaExecutionRole.Arn
+      KmsKeyArn: !GetAtt SampleEncryptionKey.Arn
+      Timeout: 30
+      MemorySize: 512
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref OutboundLogGroup
+      Environment:
+        Variables:
+          SECRETS_MANAGER_SECRET_NAME: !Ref M365Credentials
+
+  # ---------------------------------------------------------------------------
+  # Inbound schedule and its dead-letter queue. The queue receives:
+  #  - schedule events EventBridge could not deliver to the function, and
+  #  - asynchronous invocations that still failed (unhandled error or timeout)
+  #    after Lambda's retries.
+  # Errors the function catches and logs per email do not reach the queue.
+  # ---------------------------------------------------------------------------
+  InboundDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !GetAtt SampleEncryptionKey.Arn
+      KmsDataKeyReusePeriodSeconds: 300
+      MessageRetentionPeriod: 1209600
+
+  InboundDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref InboundDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowScheduleRuleOnly
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt InboundDeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt InboundEmailProcessingSchedule.Arn
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource: !GetAtt InboundDeadLetterQueue.Arn
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  InboundEmailProcessingSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Polls the Microsoft 365 mailbox for the Amazon Connect email sample
+      ScheduleExpression: !If
+        - PollingIntervalIsOne
+        - 'rate(1 minute)'
+        - !Sub 'rate(${PollingIntervalMinutes} minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt InboundEmailProcessor.Arn
+          Id: InboundEmailProcessorTarget
+          DeadLetterConfig:
+            Arn: !GetAtt InboundDeadLetterQueue.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 300
+
+  InboundLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InboundEmailProcessor
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InboundEmailProcessingSchedule.Arn
+
+  # ---------------------------------------------------------------------------
+  # Amazon Connect wiring for the outbound function
+  # ---------------------------------------------------------------------------
+  ConnectOutboundLambdaIntegration:
+    Type: AWS::Connect::IntegrationAssociation
+    Properties:
+      InstanceId: !Ref ConnectInstanceArn
+      IntegrationType: LAMBDA_FUNCTION
+      IntegrationArn: !GetAtt OutboundEmailProcessor.Arn
+
+  ConnectOutboundLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OutboundEmailProcessor
+      Action: lambda:InvokeFunction
+      Principal: connect.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Ref ConnectInstanceArn
+
+  # Outbound whisper flow: runs when an agent sends a reply, invokes the outbound
+  # function (which sends through Microsoft 365 and stops the contact so Amazon
+  # Connect does not also send it). Assign it to your email queue after deployment.
+  OutboundWhisperFlow:
+    Type: AWS::Connect::ContactFlow
+    DependsOn:
+      - ConnectOutboundLambdaIntegration
+      - ConnectOutboundLambdaPermission
+    Properties:
+      InstanceArn: !Ref ConnectInstanceArn
+      Name: !Sub 'Email - Outbound Whisper - M365 (${AWS::StackName})'
+      Description: Sends agent email replies through Microsoft 365 using the outbound Lambda function
+      Type: OUTBOUND_WHISPER
+      State: ACTIVE
+      Content: !Sub |
+        {
+          "Version": "2019-10-30",
+          "StartAction": "START-ACTION-ID",
+          "Metadata": {
+            "entryPointPosition": {"x": 40, "y": 40},
+            "ActionMetadata": {
+              "START-ACTION-ID": {"position": {"x": 156.8, "y": 39.2}},
+              "LAMBDA-ACTION-ID": {"position": {"x": 415.2, "y": 44.8}},
+              "END-ACTION-ID": {"position": {"x": 659.2, "y": 44}}
+            },
+            "name": "Email - Outbound Whisper - M365 (${AWS::StackName})",
+            "description": "Sends agent email replies through Microsoft 365 using the outbound Lambda function",
+            "type": "outboundWhisper"
+          },
+          "Actions": [
+            {
+              "Parameters": {"FlowLoggingBehavior": "Enabled"},
+              "Identifier": "START-ACTION-ID",
+              "Type": "UpdateFlowLoggingBehavior",
+              "Transitions": {"NextAction": "LAMBDA-ACTION-ID"}
+            },
+            {
+              "Parameters": {
+                "LambdaFunctionARN": "${OutboundEmailProcessor.Arn}",
+                "InvocationTimeLimitSeconds": "8",
+                "InvocationType": "SYNCHRONOUS",
+                "ResponseValidation": {"ResponseType": "STRING_MAP"}
+              },
+              "Identifier": "LAMBDA-ACTION-ID",
+              "Type": "InvokeLambdaFunction",
+              "Transitions": {
+                "NextAction": "END-ACTION-ID",
+                "Errors": [
+                  {"NextAction": "END-ACTION-ID", "ErrorType": "NoMatchingError"}
+                ]
+              }
+            },
+            {
+              "Parameters": {},
+              "Identifier": "END-ACTION-ID",
+              "Type": "EndFlowExecution",
+              "Transitions": {}
+            }
+          ]
+        }
+
+Outputs:
+  SecretsManagerSecretArn:
+    Description: ARN of the secret that holds your Microsoft 365 credentials. Update its values after deployment.
+    Value: !Ref M365Credentials
+
+  SecretsManagerSecretConsoleUrl:
+    Description: Opens the Microsoft 365 credentials secret in the AWS Secrets Manager console
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/secretsmanager/secret?name=${M365Credentials}&region=${AWS::Region}'
+
+  OutboundWhisperFlowName:
+    Description: Assign this flow as the outbound email flow of your Amazon Connect email queue
+    Value: !Sub 'Email - Outbound Whisper - M365 (${AWS::StackName})'
+
+  OutboundWhisperFlowArn:
+    Description: ARN of the outbound whisper flow created by this stack
+    Value: !GetAtt OutboundWhisperFlow.ContactFlowArn
+
+  InboundLambdaFunctionName:
+    Description: Inbound email function (polls the mailbox)
+    Value: !Ref InboundEmailProcessor
+
+  OutboundLambdaFunctionName:
+    Description: Outbound email function (sends agent replies)
+    Value: !Ref OutboundEmailProcessor
+
+  InboundAttachmentsBucketName:
+    Description: S3 bucket that stages inbound attachments for 30 days
+    Value: !Ref InboundAttachmentsBucket
+
+  AccessLogsBucketName:
+    Description: S3 bucket that holds server access logs for 90 days. Kept when the stack is deleted.
+    Value: !Ref AccessLogsBucket
+
+  InboundDeadLetterQueueUrl:
+    Description: SQS queue that receives schedule events EventBridge could not deliver to the inbound function
+    Value: !Ref InboundDeadLetterQueue
+
+  NextSteps:
+    Description: Steps to finish setup after deployment
+    Value: >-
+      1. Open SecretsManagerSecretConsoleUrl and set tenant_id, client_id, client_secret and mailbox_email
+      from your Microsoft Entra ID app registration.
+      2. In the Amazon Connect admin website, set the email queue's outbound email flow to OutboundWhisperFlowName.
+      3. Send a test email to the mailbox and reply to it as an agent.
