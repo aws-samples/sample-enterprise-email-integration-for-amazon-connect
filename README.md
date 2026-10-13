@@ -21,9 +21,8 @@ This sample keeps customer email in your Microsoft 365 (Exchange Online) mailbox
 - [Step 5: Assign the outbound whisper flow](#step-5-assign-the-outbound-whisper-flow)
 - [Step 6: Test](#step-6-test)
 - [Troubleshooting](#troubleshooting)
-- [Security design](#security-design)
-- [Known limitations](#known-limitations)
 - [Production considerations](#production-considerations)
+- [Scaling to multiple mailboxes](#scaling-to-multiple-mailboxes)
 - [Cost](#cost)
 - [Clean up](#clean-up)
 
@@ -218,34 +217,6 @@ The stack created and published `Email - Outbound Whisper - M365 (<stack-name>)`
 
 Log groups are `/aws/lambda/connect-m365-inbound-email-<stack-name>` and `/aws/lambda/connect-m365-outbound-email-<stack-name>`.
 
-## Security design
-
-- **Credentials.** The Microsoft Entra ID client secret is stored only in AWS Secrets Manager. Each function role can read only that secret. Nothing secret is in environment variables or logs. The sample uses client-secret authentication; rotate the secret before it expires by creating a new one in Microsoft Entra ID and updating the Secrets Manager value.
-- **Mailbox scope.** Path A in Step 2 limits the app to one mailbox. Path B is tenant-wide.
-- **Threading.** The inbound function does not link a reply to an earlier contact when the reply's sender differs from that contact's customer address, so a forged `In-Reply-To` header cannot pull a message into another customer's conversation.
-- **Encryption.** A customer managed AWS KMS key, with automatic rotation, encrypts the secret, the dead-letter queue, both log groups and both functions' environment variables. Its key policy lets IAM grant access in your account, and lets CloudWatch Logs and EventBridge use it only for this stack's log groups and queue.
-- **Attachments bucket.** Private (Block Public Access, bucket owner enforced), TLS only, encrypted with SSE-S3, versioned, with server access logging. Objects are deleted after 30 days, and replaced or deleted versions after 1 day, so versioning does not keep extra copies of attachments for long. Amazon Connect Customer reads attachments through presigned URLs that expire after 1 hour.
-- **Access logs bucket.** Receives server access logs for the attachments bucket and for itself (under `self/`). Private, TLS only, SSE-S3 (the only encryption S3 log delivery supports), logs deleted after 90 days.
-- **IAM.** One role per function, scoped to this stack's resources and your instance. The outbound function's access to email storage can be limited to one bucket and one KMS key with the optional parameters. The Lambda permission for Amazon Connect is limited to your instance ARN.
-- **Outbound connections.** The functions connect only over HTTPS, and only to `login.microsoftonline.com`, `graph.microsoft.com` and AWS endpoints.
-- **Logging.** Logs record contact IDs, Microsoft Graph message IDs, counts and status codes, never subjects, addresses, file names or message content. Amazon Connect Customer stores the subject and addresses on the contact by design, and flow logs record the Lambda exchange.
-- **Scanner exceptions.** The template records each security scanner check it does not meet, with the reason, in the resource's `Metadata`. They are: VPC placement for both functions, and a dead-letter queue and reserved concurrency for the synchronously invoked outbound function.
-
-## Known limitations
-
-- **Microsoft 365 only.** Google Workspace overwrites the `Message-ID` header that threading relies on.
-- **Failed replies are not retried.** If the outbound function fails after the agent sends (for example a Graph error or the 8-second flow limit), the contact is still stopped, so Amazon Connect Customer does not send the reply through Amazon SES either. The reply is not delivered and the agent is not told. Monitor the outbound function's errors (see [Production considerations](#production-considerations)).
-- **Fallback reply text.** If the outbound function cannot read the agent's reply body from storage, it sends "Thank you for your email." in its place.
-- **8-second flow limit.** Amazon Connect Customer allows the outbound function 8 seconds. Large attachments or slow Graph responses can exceed it, and the flow then ends on its error branch.
-- **Possible duplicate send.** If the outbound function fails after Microsoft Graph accepts the send, a retry could send the reply twice.
-- **Polling order and failures.** Each poll takes the newest unread messages first, up to `BatchSize`. A message that always fails stays unread and is retried on every poll, and a large backlog can delay older mail.
-- **Inbox only.** Mail that rules move to other folders, and mail in Junk Email, is not picked up.
-- **Inline images** over `INLINE_IMAGE_MAX_MB` arrive as attachments.
-- **Attachment size.** Microsoft Graph and Amazon Connect Customer size limits apply to attachments in both directions.
-- **Ten attachments per inbound email.** The inbound function processes the first 10 attachments of each email; any more are not passed to Amazon Connect Customer.
-- **Microsoft Graph throttling.** The functions do not back off and retry when Graph throttles requests. See [Microsoft Graph throttling](https://learn.microsoft.com/en-us/graph/throttling-limits).
-- **Email storage bucket name.** Unless you set `ConnectStorageBucketName`, the outbound function assumes your instance's email storage bucket name starts with `amazon-connect-`.
-
 ## Production considerations
 
 - Alarm on errors for both functions and on messages in the dead-letter queue.
@@ -254,6 +225,18 @@ Log groups are `/aws/lambda/connect-m365-inbound-email-<stack-name>` and `/aws/l
 - Run the functions in a VPC with a NAT gateway if your network policy requires it.
 - Add retry with backoff for Microsoft Graph throttling, and size limits for attachments.
 - Review Exchange Online Protection or Microsoft Defender settings for the mailbox. This sample does not scan attachments.
+
+## Scaling to multiple mailboxes
+
+Each stack serves one Microsoft 365 mailbox, because the secret holds a single `mailbox_email`. To add more mailboxes without code changes, deploy one stack per mailbox:
+
+- **One stack per mailbox.** Use a different stack name for each. Resource names include the stack name, so stacks don't collide, and each gets its own secret, functions, schedule and outbound whisper flow.
+- **One queue per mailbox.** The outbound flow sends from its stack's mailbox, so assign each stack's flow to the queue that handles that mailbox. Set `InboundContactFlowId` and `DestinationEmailAddress` per stack to route each mailbox where you want it.
+- **Never point two stacks at the same mailbox.** Both would poll it, and every email would become two contacts.
+- **Mailbox scope.** With Path A, either create a separate app registration per mailbox, which keeps credentials isolated, or reuse one app and widen the management scope, for example to a group: `-RecipientRestrictionFilter "MemberOfGroup -eq '<group-distinguished-name>'"` (find the distinguished name with `Get-Group`; only direct members are in scope). A shared app means one client secret can reach all of those mailboxes.
+- **Limits.** Each stack polls on its own schedule, so Lambda invocations and Microsoft Graph requests grow with the number of mailboxes. Graph throttles per mailbox and per app. If you reserve inbound concurrency, each stack reserves 1 from your account's Lambda concurrency quota.
+
+Serving many mailboxes from one stack needs code changes: a list of mailboxes in the secret, a poll loop over them, and outbound logic that picks the mailbox from the contact's queue or system email address.
 
 ## Cost
 
