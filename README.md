@@ -1,30 +1,27 @@
 # Route Microsoft 365 Email Through Amazon Connect Customer
 
-Companion code for the AWS Contact Center blog post [Route Microsoft 365 Email Through Amazon Connect Customer](BLOG_POST_URL) by Mark Macdonald, Ritesh Khanna and Nathan McCourt.
-
 This sample keeps customer email in your Microsoft 365 (Exchange Online) mailbox while agents work the email in Amazon Connect Customer. Two AWS Lambda functions use the Microsoft Graph API: one brings unread mail into Amazon Connect Customer as email contacts, the other sends agent replies back out through Exchange Online. Conversation threading is preserved through standard email headers, with no database.
-
-> **This is sample code, for non-production usage.** You should work with your security and legal teams to meet your organizational security, regulatory and compliance requirements before deployment.
-
-> **Third-party service.** This code interacts with Microsoft 365 (Exchange Online) and Microsoft Graph, which have terms published at [Microsoft APIs Terms of Use](https://learn.microsoft.com/en-us/legal/microsoft-apis/terms-of-use) and pricing described at [Microsoft 365 plans and pricing](https://www.microsoft.com/en-us/microsoft-365/enterprise/microsoft365-plans-and-pricing). You should be familiar with the pricing and confirm that your use case complies with the terms before proceeding.
 
 ## Contents
 
 - [Architecture](#architecture)
-- [How threading works](#how-threading-works)
-- [What gets deployed](#what-gets-deployed)
-- [Before you deploy](#before-you-deploy)
-- [Step 1: Register an app in Microsoft Entra ID](#step-1-register-an-app-in-microsoft-entra-id)
-- [Step 2: Limit the app to one mailbox](#step-2-limit-the-app-to-one-mailbox)
-- [Step 3: Deploy the stack from AWS CloudShell](#step-3-deploy-the-stack-from-aws-cloudshell)
-- [Step 4: Add your Microsoft 365 credentials](#step-4-add-your-microsoft-365-credentials)
-- [Step 5: Assign the outbound whisper flow](#step-5-assign-the-outbound-whisper-flow)
-- [Step 6: Test](#step-6-test)
+  - [How threading works](#how-threading-works)
+  - [What gets deployed](#what-gets-deployed)
+- [Deploy](#deploy)
+  - [Before you deploy](#before-you-deploy)
+  - [Step 1: Register an app in Microsoft Entra ID](#step-1-register-an-app-in-microsoft-entra-id)
+  - [Step 2: Limit the app to one mailbox](#step-2-limit-the-app-to-one-mailbox)
+  - [Step 3: Deploy the stack from AWS CloudShell](#step-3-deploy-the-stack-from-aws-cloudshell)
+  - [Step 4: Add your Microsoft 365 credentials](#step-4-add-your-microsoft-365-credentials)
+  - [Step 5: Assign the outbound whisper flow](#step-5-assign-the-outbound-whisper-flow)
+  - [Step 6: Test](#step-6-test)
 - [Troubleshooting](#troubleshooting)
-- [Production considerations](#production-considerations)
-- [Scaling to multiple mailboxes](#scaling-to-multiple-mailboxes)
-- [Cost](#cost)
+- [Considerations](#considerations)
+  - [Production readiness](#production-readiness)
+  - [Scaling to multiple mailboxes](#scaling-to-multiple-mailboxes)
+  - [Cost](#cost)
 - [Clean up](#clean-up)
+- [Notices](#notices)
 
 ## Architecture
 
@@ -35,7 +32,7 @@ This sample keeps customer email in your Microsoft 365 (Exchange Online) mailbox
 
 The integration works with Microsoft 365 (Exchange Online) only. Threading relies on Exchange Online keeping the custom `Message-ID` header this sample sets on replies. Google Workspace (Gmail) overwrites that header.
 
-## How threading works
+### How threading works
 
 The Amazon Connect Customer contact ID travels in standard RFC 5322 headers, so no lookup table is needed. The design solves two separate problems.
 
@@ -52,11 +49,11 @@ The outbound function finds the original `Message-ID` from the contact's segment
 
 The MIME message is serialized with CRLF line endings. A bare `\n` after a quoted-printable soft line break makes Exchange Online insert stray `=` characters into the delivered body.
 
-### Inline images
+#### Inline images
 
 Inline images, such as pasted screenshots and signature logos, are embedded in the message body as `data:` URIs, the same format Amazon Connect Customer uses for images an agent adds. Images larger than `INLINE_IMAGE_MAX_MB` (default 2 MB) are delivered as regular attachments.
 
-## What gets deployed
+### What gets deployed
 
 | Resource | Purpose |
 |----------|---------|
@@ -73,7 +70,9 @@ Inline images, such as pasted screenshots and signature logos, are embedded in t
 | Two IAM roles | One per function, scoped to the resources above |
 | Two Amazon CloudWatch Logs log groups | One per function, 30-day retention |
 
-## Before you deploy
+## Deploy
+
+### Before you deploy
 
 - [ ] An Amazon Connect Customer instance with the [email channel set up](https://docs.aws.amazon.com/connect/latest/adminguide/setup-email-channel.html), in the AWS account and Region you will deploy to.
 - [ ] CORS configured on the instance's email storage S3 bucket (`amazon-connect-...`), as described in [Enable attachments](https://docs.aws.amazon.com/connect/latest/adminguide/enable-attachments.html). Without it the agent workspace shows "Failed to get email message".
@@ -84,7 +83,7 @@ Inline images, such as pasted screenshots and signature logos, are embedded in t
 - [ ] Permission to create an app registration in Microsoft Entra ID, and the Exchange Administrator role (or membership of Organization Management) for Step 2.
 - [ ] AWS permissions to deploy an AWS CloudFormation stack that creates IAM roles, Lambda functions and Amazon Connect resources (including `connect:CreateContactFlow` and `connect:CreateIntegrationAssociation`), and access to AWS CloudShell.
 
-## Step 1: Register an app in Microsoft Entra ID
+### Step 1: Register an app in Microsoft Entra ID
 
 The functions sign in to Microsoft Graph as an application (client credentials flow), with no signed-in user.
 
@@ -95,11 +94,11 @@ The functions sign in to Microsoft Graph as an application (client credentials f
 
 Do not add API permissions yet. Step 2 decides how the app gets mail access.
 
-## Step 2: Limit the app to one mailbox
+### Step 2: Limit the app to one mailbox
 
 The functions need two Microsoft Graph application permissions: **Mail.ReadWrite** (read unread mail, download attachments, mark as read, create the reply draft) and **Mail.Send** (send the draft). Choose **one** of these paths. Never use both: permissions granted in Microsoft Entra ID apply to every mailbox in the tenant and are added on top of any Exchange scope.
 
-### Path A (recommended): Exchange Online RBAC for Applications
+#### Path A (recommended): Exchange Online RBAC for Applications
 
 The app gets mail access to the integration mailbox only. It has no Microsoft Graph API permissions in Microsoft Entra ID. See [Role Based Access Control for Applications in Exchange Online](https://learn.microsoft.com/en-us/exchange/permissions-exo/application-rbac).
 
@@ -129,7 +128,7 @@ The app gets mail access to the integration mailbox only. It has no Microsoft Gr
 
 Exchange can take some time to apply new role assignments. If the first test emails fail with an authorization error, wait and try again.
 
-### Path B (quick start only): Microsoft Entra ID permissions
+#### Path B (quick start only): Microsoft Entra ID permissions
 
 This path lets the app read and send mail as **every mailbox in your tenant**. Use it only in a test tenant.
 
@@ -138,7 +137,7 @@ This path lets the app read and send mail as **every mailbox in your tenant**. U
 
 Make sure you add them as **Application** permissions, not Delegated. Delegated permissions need a signed-in user and don't work here.
 
-## Step 3: Deploy the stack from AWS CloudShell
+### Step 3: Deploy the stack from AWS CloudShell
 
 Open [AWS CloudShell](https://console.aws.amazon.com/cloudshell/) in the **same Region as your Amazon Connect Customer instance**. CloudShell includes git and the AWS SAM CLI, and the functions have no third-party dependencies, so no build step is needed.
 
@@ -171,7 +170,7 @@ The SAM CLI uploads the function code to an S3 bucket it manages (stack `aws-sam
 
 To deploy from your own machine instead, install the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and the [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html), configure credentials for the account, and run the same commands.
 
-## Step 4: Add your Microsoft 365 credentials
+### Step 4: Add your Microsoft 365 credentials
 
 The stack creates the secret with placeholder values. Until you replace them, both functions log `M365 secret not configured` and do nothing else.
 
@@ -191,14 +190,14 @@ The stack creates the secret with placeholder values. Until you replace them, bo
 
 Use the console rather than a CLI command, so the client secret is not saved in your shell history. `mailbox_email` is the From address on replies, and its domain is used in the threading `Message-ID`.
 
-## Step 5: Assign the outbound whisper flow
+### Step 5: Assign the outbound whisper flow
 
 The stack created and published `Email - Outbound Whisper - M365 (<stack-name>)`, already wired to the outbound function.
 
 1. In the Amazon Connect admin website, go to **Routing**, **Queues**, and open the queue that handles this email.
 2. Under **Outbound email configuration**, set **Outbound email flow** to `Email - Outbound Whisper - M365 (<stack-name>)` (the `OutboundWhisperFlowName` output), and save.
 
-## Step 6: Test
+### Step 6: Test
 
 1. From a personal mail account, send an email with an attachment to your Microsoft 365 mailbox.
 2. Within one polling interval, accept the email contact in the agent workspace. Check the From, To, Subject, body and attachment.
@@ -217,7 +216,9 @@ The stack created and published `Email - Outbound Whisper - M365 (<stack-name>)`
 
 Log groups are `/aws/lambda/connect-m365-inbound-email-<stack-name>` and `/aws/lambda/connect-m365-outbound-email-<stack-name>`.
 
-## Production considerations
+## Considerations
+
+### Production readiness
 
 - Alarm on errors for both functions and on messages in the dead-letter queue.
 - Use certificate or federated credentials for the Microsoft Entra ID app instead of a client secret. This needs a code change to the token request.
@@ -226,7 +227,7 @@ Log groups are `/aws/lambda/connect-m365-inbound-email-<stack-name>` and `/aws/l
 - Add retry with backoff for Microsoft Graph throttling, and size limits for attachments.
 - Review Exchange Online Protection or Microsoft Defender settings for the mailbox. This sample does not scan attachments.
 
-## Scaling to multiple mailboxes
+### Scaling to multiple mailboxes
 
 Each stack serves one Microsoft 365 mailbox, because the secret holds a single `mailbox_email`. To add more mailboxes without code changes, deploy one stack per mailbox:
 
@@ -238,7 +239,7 @@ Each stack serves one Microsoft 365 mailbox, because the secret holds a single `
 
 Serving many mailboxes from one stack needs code changes: a list of mailboxes in the secret, a poll loop over them, and outbound logic that picks the mailbox from the contact's queue or system email address.
 
-## Cost
+### Cost
 
 You pay for the AWS resources this stack creates, on top of your Amazon Connect Customer charges. See [Amazon Connect pricing](https://aws.amazon.com/connect/pricing/) for email contact charges.
 
@@ -260,6 +261,12 @@ Use the [AWS Pricing Calculator](https://calculator.aws/) for your Region and vo
 6. In the Microsoft Entra admin center, delete the `Connect Customer Email Integration` app registration. If you used Path A, also remove the management role assignments, management scope and service principal in Exchange Online.
 
 Deleting the stack schedules the secret for deletion after its recovery window. The secret name is generated, so you can deploy again straight away.
+
+## Notices
+
+**This is sample code, for non-production usage.** You should work with your security and legal teams to meet your organizational security, regulatory and compliance requirements before deployment.
+
+**Third-party service.** This code interacts with Microsoft 365 (Exchange Online) and Microsoft Graph, which have terms published at [Microsoft APIs Terms of Use](https://learn.microsoft.com/en-us/legal/microsoft-apis/terms-of-use) and pricing described at [Microsoft 365 plans and pricing](https://www.microsoft.com/en-us/microsoft-365/enterprise/microsoft365-plans-and-pricing). You should be familiar with the pricing and confirm that your use case complies with the terms before proceeding.
 
 ## Security
 
