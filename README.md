@@ -100,33 +100,44 @@ The functions need two Microsoft Graph application permissions: **Mail.ReadWrite
 
 #### Path A (recommended): Exchange Online RBAC for Applications
 
-The app gets mail access to the integration mailbox only. It has no Microsoft Graph API permissions in Microsoft Entra ID. See [Role Based Access Control for Applications in Exchange Online](https://learn.microsoft.com/en-us/exchange/permissions-exo/application-rbac).
+The app gets mail access to the integration mailbox only. It has no Microsoft Graph application permissions in Microsoft Entra ID (the default delegated `User.Read` is unused and can be removed). You need the **Exchange Administrator** role. See [Role Based Access Control for Applications in Exchange Online](https://learn.microsoft.com/en-us/exchange/permissions-exo/application-rbac).
 
-1. Install the ExchangeOnlineManagement PowerShell module and connect with `Connect-ExchangeOnline`. See [Connect to Exchange Online PowerShell](https://learn.microsoft.com/en-us/powershell/exchange/connect-to-exchange-online-powershell).
-2. In the Microsoft Entra admin center, open **Enterprise applications**, select `Connect Customer Email Integration`, and copy its **Application ID** and **Object ID**. Use the Enterprise applications page, not App registrations, which shows a different object ID.
-3. Run the following, replacing the placeholders:
+1. In [PowerShell 7](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell) (`pwsh` on macOS and Linux), install the module and connect. Check that the tenant ID matches the **Directory (tenant) ID** from Step 1. See [Connect to Exchange Online PowerShell](https://learn.microsoft.com/en-us/powershell/exchange/connect-to-exchange-online-powershell).
 
    ```powershell
-   New-ServicePrincipal -AppId <application-id> -ObjectId <enterprise-app-object-id> -DisplayName "Connect Customer Email Integration"
+   Install-Module ExchangeOnlineManagement -Scope CurrentUser
+   Connect-ExchangeOnline
+   (Get-ConnectionInformation).TenantID
+   ```
+
+2. In the Microsoft Entra admin center, open **Enterprise applications**, select `Connect Customer Email Integration`, and copy its **Application ID** and **Object ID**. Use the Enterprise applications page, not App registrations: the App registrations object ID makes `New-ServicePrincipal` fail with `AADServicePrincipalNotFound`.
+3. Set your values and run the commands. If one fails, fix it and re-run only the failed commands.
+
+   ```powershell
+   $AppId    = "<application-id>"
+   $ObjectId = "<enterprise-app-object-id>"
+   $Mailbox  = "support@yourdomain.com"
+
+   New-ServicePrincipal -AppId $AppId -ObjectId $ObjectId -DisplayName "Connect Customer Email Integration"
 
    New-ManagementScope -Name "Connect Customer Email Integration mailbox" `
-     -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'support@yourdomain.com'"
+     -RecipientRestrictionFilter "PrimarySmtpAddress -eq '$Mailbox'"
 
-   New-ManagementRoleAssignment -App <enterprise-app-object-id> -Role "Application Mail.ReadWrite" `
+   New-ManagementRoleAssignment -App $ObjectId -Role "Application Mail.ReadWrite" `
      -CustomResourceScope "Connect Customer Email Integration mailbox"
 
-   New-ManagementRoleAssignment -App <enterprise-app-object-id> -Role "Application Mail.Send" `
+   New-ManagementRoleAssignment -App $ObjectId -Role "Application Mail.Send" `
      -CustomResourceScope "Connect Customer Email Integration mailbox"
    ```
 
 4. Check the scope. The first command should show `InScope` as `True` for both roles, and the second, against any other mailbox, should show `False`:
 
    ```powershell
-   Test-ServicePrincipalAuthorization -Identity <enterprise-app-object-id> -Resource support@yourdomain.com
-   Test-ServicePrincipalAuthorization -Identity <enterprise-app-object-id> -Resource someone.else@yourdomain.com
+   Test-ServicePrincipalAuthorization -Identity $ObjectId -Resource $Mailbox | Format-Table RoleName,InScope
+   Test-ServicePrincipalAuthorization -Identity $ObjectId -Resource someone.else@yourdomain.com | Format-Table RoleName,InScope
    ```
 
-Exchange can take some time to apply new role assignments. If the first test emails fail with an authorization error, wait and try again.
+Exchange caches app permissions for 30 minutes to 2 hours, and the test command bypasses that cache. If the functions get an authorization error while the test passes, wait and try again. The same delay applies when switching from Path B: after you remove the Entra permissions, the old tenant-wide access can last up to 2 hours.
 
 #### Path B (quick start only): Microsoft Entra ID permissions
 
@@ -258,7 +269,13 @@ Use the [AWS Pricing Calculator](https://calculator.aws/) for your Region and vo
 3. In CloudShell, from the repository folder, run `sam delete --stack-name <stack-name>`. This removes the functions, flow, secret, roles, log groups, queue and attachments bucket, and schedules the KMS key for deletion after 7 days.
 4. The access logs bucket (the `AccessLogsBucketName` output) is kept as an audit record, and its logs expire after 90 days. To remove it, wait a day for the last log deliveries, then empty and delete it in the Amazon S3 console.
 5. Optionally, if no other stack uses it, delete the SAM CLI's `aws-sam-cli-managed-default` stack and its bucket.
-6. In the Microsoft Entra admin center, delete the `Connect Customer Email Integration` app registration. If you used Path A, also remove the management role assignments, management scope and service principal in Exchange Online.
+6. In the Microsoft Entra admin center, delete the `Connect Customer Email Integration` app registration. If you used Path A, first remove the Exchange Online objects:
+
+   ```powershell
+   Get-ManagementRoleAssignment -RoleAssignee <enterprise-app-object-id> | Remove-ManagementRoleAssignment -Confirm:$false
+   Remove-ManagementScope "Connect Customer Email Integration mailbox" -Confirm:$false
+   Remove-ServicePrincipal -Identity <enterprise-app-object-id> -Confirm:$false
+   ```
 
 Deleting the stack schedules the secret for deletion after its recovery window. The secret name is generated, so you can deploy again straight away.
 
