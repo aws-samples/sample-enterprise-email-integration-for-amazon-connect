@@ -141,6 +141,15 @@ Make sure you add them as **Application** permissions, not Delegated. Delegated 
 
 Open [AWS CloudShell](https://console.aws.amazon.com/cloudshell/) in the **same Region as your Amazon Connect Customer instance**. CloudShell includes git and the AWS SAM CLI, and the functions have no third-party dependencies, so no build step is needed.
 
+Have these values ready:
+
+| Value | Where to find it |
+|-------|------------------|
+| Instance ARN | Amazon Connect console, choose your instance, **Instance ARN** on the overview page. Enter the full ARN, for example `arn:aws:connect:us-east-1:123456789012:instance/11111111-2222-3333-4444-555555555555`. The instance ID alone is rejected. |
+| Inbound flow ID | Amazon Connect admin website, **Routing**, **Flows**, open the flow, then copy the ID at the end of its ARN (under **Show additional flow information**). Enter the ID only, not the name or ARN. |
+| Destination email address | Amazon Connect admin website, **Channels**, **Email addresses**. See the note below the prompts. |
+| Email storage bucket name | Amazon Connect console, your instance, **Data storage**, **Email messages**. Or run `aws connect list-instance-storage-configs --instance-id <instance-id> --resource-type EMAIL_MESSAGES --query 'StorageConfigs[0].S3Config.BucketName' --output text`. |
+
 ```bash
 git clone https://github.com/aws-samples/sample-enterprise-email-integration-for-amazon-connect.git
 cd sample-enterprise-email-integration-for-amazon-connect
@@ -151,20 +160,22 @@ Answer the prompts:
 
 | Prompt | What to enter |
 |--------|---------------|
-| Stack Name | A short name, for example `connect-m365-email`. It is added to resource names. |
+| Stack Name | A short name, for example `connect-m365-email`. It is added to resource names. Use a name not already deployed in this account and Region: an existing stack with the same name is updated instead. |
 | AWS Region | The Region of your Amazon Connect Customer instance |
-| ConnectInstanceArn | Your instance ARN, from the instance page in the Amazon Connect console |
-| InboundContactFlowId | The ID of your inbound email flow (the last part of the flow ARN) |
+| ConnectInstanceArn | The full instance ARN |
+| InboundContactFlowId | The inbound email flow ID |
 | DestinationEmailAddress | Your Amazon Connect Customer email address for this integration |
-| ConnectStorageBucketName | Optional. Your instance's email storage bucket name, to limit the outbound function to that bucket. Press Enter to allow any `amazon-connect-` bucket in the account. |
+| ConnectStorageBucketName | Your instance's email storage bucket name. Recommended: if you leave it empty, the outbound function can only read buckets whose names start with `amazon-connect-`, and agent reply attachments fail on instances whose bucket is named differently. |
 | ConnectStorageKmsKeyArn | Optional. The KMS key ARN that encrypts that bucket, to limit decryption to that key. Press Enter to skip. |
 | BatchSize | Press Enter for 10 |
 | PollingIntervalMinutes | Press Enter for 5 |
 | ReserveInboundConcurrency | Press Enter for `true`. See [Troubleshooting](#troubleshooting) if deployment fails on concurrency. |
-| Confirm changes before deploy | `Y` |
+| Confirm changes before deploy | `Y` to review the changes first. SAM then asks **Deploy this changeset?**: enter `y`, because pressing Enter cancels the deployment. |
 | Allow SAM CLI IAM role creation | `Y` |
 | Disable rollback | `N` |
-| Save arguments to configuration file | `N` |
+| Save arguments to configuration file | `Y`, then press Enter for **SAM configuration file** and **SAM configuration environment**. Later updates then need only `sam deploy`. |
+
+**About DestinationEmailAddress.** This is an email address that already exists in your Amazon Connect Customer instance, for example `support@<instance-alias>.email.connect.aws`. It is not your Microsoft 365 mailbox. Customers never see or write to it: they write to the Microsoft 365 mailbox, and the inbound function records this address as the destination of each email contact it creates in Amazon Connect Customer. The contact starts in the flow you gave as `InboundContactFlowId`. Use an address dedicated to this integration, so contacts from Microsoft 365 are easy to tell apart from mail sent directly to Amazon Connect Customer.
 
 The SAM CLI uploads the function code to an S3 bucket it manages (stack `aws-sam-cli-managed-default`) and creates the stack. When it finishes, it prints the stack outputs. Keep them for the next steps.
 
