@@ -75,11 +75,11 @@ Inline images, such as pasted screenshots and signature logos, are embedded in t
 ### Before you deploy
 
 - [ ] An Amazon Connect Customer instance with the [email channel set up](https://docs.aws.amazon.com/connect/latest/adminguide/setup-email-channel.html), in the AWS account and Region you will deploy to.
-- [ ] CORS configured on the instance's email storage S3 bucket (`amazon-connect-...`), as described in [Enable attachments](https://docs.aws.amazon.com/connect/latest/adminguide/enable-attachments.html). Without it the agent workspace shows "Failed to get email message".
+- [ ] CORS configured on the instance's email storage S3 bucket, as described in [Enable attachments](https://docs.aws.amazon.com/connect/latest/adminguide/enable-attachments.html). Without it the agent workspace shows "Failed to get email message".
 - [ ] An Amazon Connect Customer email address for this integration, for example `support@<instance-alias>.email.connect.aws`. It is separate from your Microsoft 365 mailbox address: customers write to the Microsoft 365 mailbox, and the inbound function uses the Amazon Connect Customer address as the contact's destination.
 - [ ] A published inbound email flow that sets a working queue, and its flow ID.
 - [ ] An email queue that has an outbound email address set.
-- [ ] A dedicated Microsoft 365 mailbox for this integration. The inbound function only picks up unread mail in the Inbox, so anyone else reading the mailbox can hide messages from it.
+- [ ] A dedicated Microsoft 365 mailbox for this integration. The inbound function only picks up unread mail in the Inbox, so anyone else reading the mailbox can hide messages from it. Every message that is unread when you finish Step 4 becomes an email contact on the first poll, so mark existing Inbox mail as read first.
 - [ ] Permission to create an app registration in Microsoft Entra ID, and the Exchange Administrator role (or membership of Organization Management) for Step 2.
 - [ ] AWS permissions to deploy an AWS CloudFormation stack that creates IAM roles, Lambda functions and Amazon Connect resources (including `connect:CreateContactFlow` and `connect:CreateIntegrationAssociation`), and access to AWS CloudShell.
 
@@ -210,13 +210,15 @@ The stack creates the secret with placeholder values. Until you replace them, bo
 
 3. Save.
 
+Replace all four values. `client_secret` starts as a random generated value rather than `REPLACE_ME`, so it can look already set.
+
 Use the console rather than a CLI command, so the client secret is not saved in your shell history. `mailbox_email` is the From address on replies, and its domain is used in the threading `Message-ID`.
 
 ### Step 5: Assign the outbound whisper flow
 
 The stack created and published `Email - Outbound Whisper - M365 (<stack-name>)`, already wired to the outbound function.
 
-1. In the Amazon Connect admin website, go to **Routing**, **Queues**, and open the queue that handles this email.
+1. In the Amazon Connect admin website, go to **Routing**, **Queues**, and open the queue your inbound flow (`InboundContactFlowId`) transfers email contacts to. If the flow uses a different queue, agents on this queue never see the contacts, and replies from the other queue do not go through Microsoft 365.
 2. Under **Outbound email configuration**, set **Outbound email flow** to `Email - Outbound Whisper - M365 (<stack-name>)` (the `OutboundWhisperFlowName` output), and save.
 
 ### Step 6: Test
@@ -234,6 +236,7 @@ The stack created and published `Email - Outbound Whisper - M365 (<stack-name>)`
 | No contacts appear | Inbound function log group: look for `M365 secret not configured`, token errors, or a Graph `error.code` such as `ErrorAccessDenied` (scope or consent missing, see Step 2). Confirm the message is unread and in the Inbox. |
 | Agent workspace shows "Failed to get email message" | CORS on the instance's email storage bucket, see [Before you deploy](#before-you-deploy). |
 | Agent replies never arrive | Outbound function log group, and that the queue's outbound email flow is the stack's flow (Step 5). The function returns `status` and a short `reason` code to the flow. |
+| Agent reply arrives from the Amazon Connect Customer address, not Microsoft 365, and isn't nested | The reply was sent by Amazon SES, not the outbound function. Set the outbound email flow on the queue the contact was in (Step 5). |
 | Customer replies start a new conversation | The reply came from a different address than the original email, or the customer's mail client dropped `In-Reply-To`. |
 
 Log groups are `/aws/lambda/connect-m365-inbound-email-<stack-name>` and `/aws/lambda/connect-m365-outbound-email-<stack-name>`.
@@ -288,7 +291,7 @@ Use the [AWS Pricing Calculator](https://calculator.aws/) for your Region and vo
    Remove-ServicePrincipal -Identity <enterprise-app-object-id> -Confirm:$false
    ```
 
-Deleting the stack schedules the secret for deletion after its recovery window. The secret name is generated, so you can deploy again straight away.
+Deleting the stack deletes the secret immediately, with no recovery window, so copy the values first if you need them again. The secret name is generated, so you can deploy again straight away.
 
 ## Notices
 
