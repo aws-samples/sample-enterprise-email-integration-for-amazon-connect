@@ -311,3 +311,4 @@ This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) fil
 
 - [Mark Macdonald](https://github.com/MarkMacd)
 - [Ritesh Khanna](https://github.com/vrbros)
+- [Nathan McCourt](https://github.com/natetech-amazon)
